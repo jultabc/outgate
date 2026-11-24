@@ -1,0 +1,75 @@
+# gitleaks-traces.toml - generic "trace" rules for gitleaks (no secrets engine of its own).
+#
+# Tested with gitleaks 8.30.1 (major 8). Other major versions are not supported.
+#
+# Do NOT add `[extend] useDefault = true` here: gitleaks' default global
+# allowlist (lock files, node_modules, vendor ...) would then also suppress these
+# rules. The default secret rules are run separately by bin/trace-guard.
+#
+# Each rule that can appear in a name also has a "-name" twin. gitleaks content rules never
+# look at file or folder names, so bin/trace-guard writes every path of the pushed range as a
+# line "TRACEGUARD-PATH:<path>" into a text and scans that with `gitleaks stdin`. The -name rules
+# match only those marker lines. Do not use the -name rules with `gitleaks git` / `gitleaks dir`.
+#
+# Personal e-mail domain list (edit it in BOTH the personal-email and the
+# personal-email-name rule below, they must stay identical):
+#   gmail.com naver.com daum.net hanmail.net kakao.com outlook.com hotmail.com
+#   yahoo.com icloud.com proton.me protonmail.com
+# (the same alternation string appears in personal-email and personal-email-name; a test compares them)
+#
+# Names that are never reported as a home folder (examples / system accounts), same
+# list in home-folder and its allowlist:
+#   Shared Public Guest Default username user example runner ubuntu ec2-user
+#   vagrant docker admin root tester alice bob you yourname name me test foo bar
+#   john jane
+#
+# home-folder needs a non-word character (or line start) before /Users/ or /home/, so the
+# marker lines ("TRACEGUARD-PATH:src/home/x") are left to the home-folder-name rule.
+#
+# Go RE2 syntax: no lookahead / lookbehind.
+
+[[rules]]
+id = "personal-email"
+description = "Personal e-mail address"
+regex = '''(?i)[A-Za-z0-9._%+-]+@(?:gmail\.com|naver\.com|daum\.net|hanmail\.net|kakao\.com|outlook\.com|hotmail\.com|yahoo\.com|icloud\.com|proton\.me|protonmail\.com)\b'''
+
+[[rules]]
+id = "home-folder"
+description = "Absolute home directory path with an account name (macOS, Linux, Windows)"
+regex = '''(?im)(?:(?:^|[^A-Za-z0-9_.-])(?:/Users/|/home/)|\b[A-Za-z]:[\\/]{1,4}Users[\\/]{1,4})[A-Za-z0-9._-]{2,64}'''
+[[rules.allowlists]]
+regexTarget = "match"
+regexes = ['''(?i)[\\/](?:Shared|Public|Guest|Default|username|user|example|runner|ubuntu|ec2-user|vagrant|docker|admin|root|tester|alice|bob|you|yourname|name|me|test|foo|bar|john|jane)[._-]*$''']
+
+[[rules]]
+id = "kr-rrn"
+description = "Korean resident registration number pattern"
+regex = '''\b\d{6}-[1-4]\d{6}\b'''
+
+[[rules]]
+id = "kr-phone"
+description = "Korean mobile phone number pattern"
+regex = '''\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b'''
+
+[[rules]]
+id = "personal-email-name"
+description = "Personal e-mail address in a file or folder name"
+regex = '''(?i)TRACEGUARD-PATH:.*[A-Za-z0-9._%+-]+@(?:gmail\.com|naver\.com|daum\.net|hanmail\.net|kakao\.com|outlook\.com|hotmail\.com|yahoo\.com|icloud\.com|proton\.me|protonmail\.com)\b'''
+
+[[rules]]
+id = "home-folder-name"
+description = "Home directory path used as a file or folder name"
+regex = '''(?i)TRACEGUARD-PATH:(?:(?:Users|home)/|.*[A-Za-z]:[\\/]+Users[\\/]+)[A-Za-z0-9._-]{2,64}'''
+[[rules.allowlists]]
+regexTarget = "match"
+regexes = ['''(?i)[\\/](?:Shared|Public|Guest|Default|username|user|example|runner|ubuntu|ec2-user|vagrant|docker|admin|root|tester|alice|bob|you|yourname|name|me|test|foo|bar|john|jane)[._-]*$''']
+
+[[rules]]
+id = "kr-rrn-name"
+description = "Korean resident registration number pattern in a file or folder name"
+regex = '''TRACEGUARD-PATH:.*\b\d{6}-[1-4]\d{6}\b'''
+
+[[rules]]
+id = "kr-phone-name"
+description = "Korean mobile phone number pattern in a file or folder name"
+regex = '''TRACEGUARD-PATH:.*\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b'''

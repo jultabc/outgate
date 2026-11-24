@@ -1,0 +1,22 @@
+# words.example.toml - example "user words" file for trace-guard.
+#
+# Copy this file somewhere outside the repository, add your own rules, and point
+# trace-guard at it:   git config traceguard.words /absolute/path/words.toml
+#
+# Put your own names, internal repository names, host names, project code names
+# and similar strings here, one rule per word group. Only [[rules]] tables are
+# allowed. [allowlist], [[allowlists]], [extend] and any other table make
+# trace-guard refuse to run (a words file must not be able to switch checks off).
+#
+# Use Go RE2 syntax (no lookahead / lookbehind).
+#
+# File and folder names: trace-guard writes every path of the pushed range as a
+# line "TRACEGUARD-PATH:<path>" and scans that list with all rules of the pack AND this
+# file. A rule here therefore also catches the word inside a file or folder name; no
+# separate twin rule is needed. (Do not use `path =` rules: they only fire for files
+# that have a content diff.)
+
+[[rules]]
+id = "user-word"
+description = "Example user word (replace with your own)"
+regex = '''(?i)\bexampleword\b'''

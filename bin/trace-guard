@@ -1,0 +1,343 @@
+#!/bin/sh
+# trace-guard - pre-push bridge between git and gitleaks (rule pack: gitleaks-traces.toml).
+# Tested with gitleaks 8.30.1. Exit 0 = nothing found, anything else = blocked.
+set -eu
+
+# ---- constants (one place) -------------------------------------------------
+MIN_VERSION=8.30.1
+MAJOR=8
+LSREMOTE_TIMEOUT=60
+
+die() {
+    echo "trace-guard: $*" >&2
+    exit 1
+}
+say() { echo "trace-guard: $*"; }
+
+# ---- repo location, computed while the hook environment is intact -----------
+GD=$(git rev-parse --absolute-git-dir 2>/dev/null) || die "cannot locate the git directory"
+TOP=$(git rev-parse --show-toplevel 2>/dev/null || true)
+
+for v in GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
+    GIT_NAMESPACE GIT_COMMON_DIR; do
+    unset "$v" || true
+done
+for v in $(env | sed -n 's/^\(GITLEAKS_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    unset "$v" || true
+done
+GIT_NO_REPLACE_OBJECTS=1
+export GIT_NO_REPLACE_OBJECTS
+
+g() { git --git-dir="$GD" "$@"; }
+shown() { # shown <value>: user paths are printed only with TRACEGUARD_SHOW=1
+    if [ "$SHOW" = "1" ]; then echo "$1"; else echo "(path hidden; TRACEGUARD_SHOW=1 prints it)"; fi
+}
+SHOW=${TRACEGUARD_SHOW:-0} # 1 = print raw values (local terminal only)
+PATH_MARK='TRACEGUARD-PATH:'
+rname() { # rname <position> <raw ref>: never print a ref name unless SHOW=1
+    if [ "$SHOW" = 1 ]; then echo "$2"; else echo "ref#$1"; fi
+}
+
+[ $# -ge 2 ] || die "usage: trace-guard <remote name> <push url> (ref lines on stdin)"
+URL=$2
+
+# ---- gitleaks presence and version -------------------------------------------
+command -v gitleaks >/dev/null 2>&1 || die "gitleaks not found on PATH (need $MIN_VERSION or newer, major $MAJOR)"
+VER=$(gitleaks version 2>/dev/null | sed -n 's/^[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | sed -n 1p)
+[ -n "$VER" ] || die "cannot read the gitleaks version"
+vpart() { echo "$1" | cut -d. -f"$2"; }
+[ "$(vpart "$VER" 1)" = "$MAJOR" ] || die "gitleaks $VER: major version must be $MAJOR"
+vlt() { # true when $1 < $2
+    i=1
+    while [ $i -le 3 ]; do
+        a=$(vpart "$1" $i)
+        b=$(vpart "$2" $i)
+        [ "$a" -lt "$b" ] && return 0
+        [ "$a" -gt "$b" ] && return 1
+        i=$((i + 1))
+    done
+    return 1
+}
+if vlt "$VER" "$MIN_VERSION"; then die "gitleaks $VER is older than $MIN_VERSION"; fi
+
+# ---- temp dir ------------------------------------------------------------------
+T=$(mktemp -d "${TMPDIR:-/tmp}/trace-guard.XXXXXX") || die "mktemp failed"
+trap 'rm -rf "$T"' EXIT
+trap 'exit 1' HUP INT TERM
+mkdir "$T/ign0" "$T/ign1"
+
+# ---- configuration ---------------------------------------------------------------
+resolve_self() {
+    s=$1
+    while [ -L "$s" ]; do
+        d=$(cd "$(dirname "$s")" && pwd -P)
+        l=$(readlink "$s")
+        case $l in /*) s=$l ;; *) s=$d/$l ;; esac
+    done
+    echo "$(cd "$(dirname "$s")" && pwd -P)/$(basename "$s")"
+}
+SELF=$(resolve_self "$0")
+PACK=$(g config --get traceguard.pack 2>/dev/null || true)
+[ -n "$PACK" ] || PACK=$(dirname "$SELF")/../gitleaks-traces.toml
+[ -f "$PACK" ] && [ -r "$PACK" ] || die "rule pack not readable: $(shown "$PACK")"
+WORDS=$(g config --get traceguard.words 2>/dev/null || true)
+IGNF=$(g config --get traceguard.ignorefile 2>/dev/null || true)
+
+cat "$PACK" >"$T/eff.toml"
+if [ -n "$WORDS" ]; then
+    [ -f "$WORDS" ] && [ -r "$WORDS" ] || die "words file not readable: $(shown "$WORDS")"
+    # only [[rules]] tables; the first meaningful line must be [[rules]]
+    if ! awk '
+        { l=$0; sub(/^[ \t]+/,"",l); sub(/[ \t\r]+$/,"",l) }
+        l=="" || substr(l,1,1)=="#" { next }
+        !seen && l !~ /^\[\[rules\]\]([ \t]*#.*)?$/ { bad=1 }
+        substr(l,1,1)=="[" && l !~ /^\[\[rules\]\]([ \t]*#.*)?$/ { bad=1 }
+        l ~ /^\[\[rules\]\]/ { seen=1 }
+        END { exit (bad || !seen) ? 1 : 0 }' "$WORDS"; then
+        die "words file may contain only [[rules]] tables (found something else or nothing): $(shown "$WORDS")"
+    fi
+    printf '\n' >>"$T/eff.toml"
+    cat "$WORDS" >>"$T/eff.toml"
+fi
+printf '[extend]\nuseDefault = true\n' >"$T/def.toml"
+
+IGN_DIR=$T/ign0
+if [ -n "$IGNF" ]; then
+    case $IGNF in /*) ;; *) die "traceguard.ignorefile must be an absolute path: $(shown "$IGNF")" ;; esac
+    [ ! -L "$IGNF" ] || die "traceguard.ignorefile must not be a symbolic link: $(shown "$IGNF")"
+    [ -f "$IGNF" ] && [ -r "$IGNF" ] || die "ignore file not readable: $(shown "$IGNF")"
+    idir=$(cd "$(dirname "$IGNF")" && pwd -P)
+    if [ -n "$TOP" ]; then
+        top=$(cd "$TOP" && pwd -P)
+        case $idir/ in "$top"/*) die "traceguard.ignorefile must be outside the repository work tree: $(shown "$IGNF")" ;; esac
+    fi
+    case $idir/ in "$GD"/*) die "traceguard.ignorefile must be outside the repository: $(shown "$IGNF")" ;; esac
+    cp "$IGNF" "$T/ign1/.gitleaksignore"
+    IGN_DIR=$T/ign1
+    say "using allow file $(shown "$IGNF")"
+fi
+
+# ---- remote ends (the base of the range) ----------------------------------------
+LSRC=0
+if command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift; exec @ARGV' "$LSREMOTE_TIMEOUT" git --git-dir="$GD" ls-remote --heads --tags "$URL" >"$T/ls.txt" 2>"$T/ls.err" || LSRC=$?
+else
+    say "perl not found: git ls-remote runs without a time limit"
+    g ls-remote --heads --tags "$URL" >"$T/ls.txt" 2>"$T/ls.err" || LSRC=$?
+fi
+[ "$LSRC" -eq 0 ] || die "git ls-remote failed or timed out (rc=$LSRC) for the push url; cannot choose a base"
+
+TAB=$(printf '\t')
+: >"$T/tips.txt"
+while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    sha=${line%%"$TAB"*}
+    ref=${line#*"$TAB"}
+    [ "$sha" != "$line" ] && [ "$ref" != "$line" ] || die "malformed git ls-remote line"
+    case $sha in *[!0-9a-f]*) die "malformed git ls-remote line (sha)" ;; esac
+    [ ${#sha} -eq 40 ] || [ ${#sha} -eq 64 ] || die "malformed git ls-remote line (sha length)"
+    case $ref in refs/heads/* | refs/tags/*) ;; *) die "malformed git ls-remote line (ref)" ;; esac
+    # keep only objects that exist locally and peel to a commit
+    if c=$(g rev-parse --verify -q "$sha^{commit}" 2>/dev/null); then
+        echo "$c" >>"$T/tips.txt"
+    fi
+done <"$T/ls.txt"
+
+NOT=""
+SHALLOW=$(g rev-parse --is-shallow-repository 2>/dev/null) || die "cannot tell whether the repository is shallow"
+case $SHALLOW in true | false) ;; *) die "cannot tell whether the repository is shallow" ;; esac
+if [ "$SHALLOW" = "true" ]; then
+    say "shallow repository: scanning everything reachable"
+else
+    for c in $(sort -u "$T/tips.txt"); do NOT="$NOT $c"; done
+fi
+[ -z "$NOT" ] || NOT=" --not$NOT"
+
+# ---- scan from a clean shared clone (no work tree, no in-repo ignore files) ------
+# every git command whose output becomes scan input runs in this clone, with no user config
+git clone -q --shared --no-checkout "$GD" "$T/c" || die "temporary clone failed"
+
+GL_ENV="GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1"
+gc() { env $GL_ENV git -C "$T/c" -c log.showRoot=true -c core.quotePath=false "$@"; }
+LOGFLAGS="-m --root --no-renames --no-textconv --no-ext-diff --no-color --no-mailmap --encoding=UTF-8"
+
+# ---- per pushed ref -----------------------------------------------------------------
+: >"$T/meta.txt"
+: >"$T/refs.txt"
+SHAS=""
+POS=0
+is_hex_sha() { # 40 or 64 lowercase hex chars
+    case $1 in *[!0-9a-f]* | "") return 1 ;; esac
+    [ ${#1} -eq 40 ] || [ ${#1} -eq 64 ]
+}
+while read -r lref lsha rref rsha extra || [ -n "${lref:-}" ]; do
+    [ -n "${lref:-}" ] || continue
+    POS=$((POS + 1))
+    RN=$(rname "$POS" "${rref:-$lref}")
+    [ -n "${rsha:-}" ] && [ -z "${extra:-}" ] || die "malformed ref line #$POS on stdin (need exactly 4 fields)"
+    is_hex_sha "$lsha" || die "malformed ref line #$POS on stdin (local sha)"
+    is_hex_sha "$rsha" || die "malformed ref line #$POS on stdin (remote sha)"
+    case $lsha in *[!0]*) ;; *) continue ;; esac # delete push: nothing goes up
+    case $rref in
+        refs/heads/*) is_tag=0 ;;
+        refs/tags/*) is_tag=1 ;;
+        *) die "unsupported ref: $RN (only refs/heads/* and refs/tags/* are checked)" ;;
+    esac
+    g cat-file -e "$lsha" 2>/dev/null || die "object $lsha for $RN not found in this repository"
+    obj=$lsha
+    if [ $is_tag -eq 1 ]; then
+        n=0
+        while [ "$(g cat-file -t "$obj" 2>/dev/null)" = "tag" ]; do
+            n=$((n + 1))
+            [ $n -le 50 ] || die "tag chain too deep: $RN"
+            gc cat-file -p "$obj" >>"$T/meta.txt" || die "cannot read tag object of $RN"
+            printf '\n' >>"$T/meta.txt"
+            obj=$(gc cat-file -p "$obj" | sed -n 's/^object \([0-9a-f]*\)$/\1/p' | sed -n 1p)
+            [ -n "$obj" ] || die "cannot read tag target of $RN"
+            g cat-file -e "$obj" 2>/dev/null || die "tag target of $RN not found"
+        done
+    fi
+    [ "$(g cat-file -t "$obj" 2>/dev/null)" = "commit" ] || die "$RN does not point to a commit"
+    printf '%s\n%s\n' "$lref" "$rref" >>"$T/meta.txt"
+    echo "$POS $obj" >>"$T/refs.txt"
+    SHAS="$SHAS $obj"
+done
+
+if [ -z "$SHAS" ]; then
+    say "nothing to scan (no pushed refs)"
+    exit 0
+fi
+RANGE="$(echo "$SHAS" | sed 's/^ //')$NOT"
+
+# commit metadata (author, committer, message), all in range
+# shellcheck disable=SC2086
+gc log --no-mailmap --encoding=UTF-8 --no-color --format='%an <%ae>%n%cn <%ce>%n%B' $RANGE >>"$T/meta.txt" || die "git log failed"
+
+# every path name that appears in the range (adds, modifies, deletes, both names of a rename),
+# one per line behind a marker so the name rules of the pack only look at these lines.
+# gitleaks builds no fragment for empty files and pure renames, so names are scanned as text.
+# Raw names (-z: NUL separated, never display-quoted). Control characters inside a name
+# (\001-\037, \177, so newline and tab too) become "?" BEFORE NUL turns into the line
+# break, so a name can neither split a line nor hide the start of the path. tr ranges and octal
+# escapes behave the same in BSD (macOS) and GNU tr; LC_ALL=C keeps it byte-wise.
+gc log -z $LOGFLAGS --format= --name-only $RANGE >"$T/names.raw" || die "git log (names) failed"
+LC_ALL=C tr '\001-\037\177' '?' <"$T/names.raw" >"$T/names.q" || die "name conversion failed (control characters)"
+LC_ALL=C tr '\000' '\n' <"$T/names.q" >"$T/names.l" || die "name conversion failed (separators)"
+LC_ALL=C sort -u "$T/names.l" >"$T/names.s" || die "name conversion failed (sort)"
+sed -n "/./s/^/$PATH_MARK/p" "$T/names.s" >"$T/paths.txt" || die "name conversion failed (marker)"
+
+# gitleaks can exit 0 although its own `git log` failed (missing object, partial clone):
+# (a) read every object of the range ourselves, (b) treat error lines on stderr as unknown.
+# shellcheck disable=SC2086
+gc log -p $LOGFLAGS $RANGE >/dev/null 2>"$T/readall.err" \
+    || die "cannot read every object in the range (partial or broken clone?)"
+run_gl() { # run_gl <report> <args...>
+    rep=$1
+    shift
+    rc=0
+    env $GL_ENV gitleaks "$@" --ignore-gitleaks-allow -i "$IGN_DIR" --redact --no-banner -f json -r "$rep" -l warn >"$T/gl.out" 2>"$T/gl.err" || rc=$?
+    if grep -Eiq '\[git\]|fatal|error|ERR' "$T/gl.err"; then return 99; fi
+    return $rc
+}
+
+FAIL=0
+UNKNOWN=0
+note_rc() { # note_rc <rc> <label>
+    case $1 in
+        0) ;;
+        1) FAIL=1 ;;
+        *) UNKNOWN=1 ;;
+    esac
+}
+
+rc=0
+run_gl "$T/r1.json" git "$T/c" -c "$T/eff.toml" --log-opts="-m $RANGE" || rc=$?
+note_rc $rc pack
+rc=0
+run_gl "$T/r2.json" git "$T/c" -c "$T/def.toml" --log-opts="-m $RANGE" || rc=$?
+note_rc $rc default
+rc=0
+run_gl "$T/r3.json" stdin -c "$T/eff.toml" <"$T/meta.txt" || rc=$?
+note_rc $rc meta
+rc=0
+run_gl "$T/r4.json" stdin -c "$T/def.toml" <"$T/meta.txt" || rc=$?
+note_rc $rc meta-default
+if [ -s "$T/paths.txt" ]; then
+    rc=0
+    run_gl "$T/r5.json" stdin -c "$T/eff.toml" <"$T/paths.txt" || rc=$?
+    note_rc $rc names
+    rc=0
+    run_gl "$T/r6.json" stdin -c "$T/def.toml" <"$T/paths.txt" || rc=$?
+    note_rc $rc names-default
+fi
+
+summarize() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -I - "$T" "$SHOW" "$PATH_MARK" <<'PY' || true
+import hashlib, json, os, sys
+t, show, mark = sys.argv[1], sys.argv[2] == "1", sys.argv[3]
+kinds = {"r1": "file contents (pack)", "r2": "file contents (default rules)",
+         "r3": "commit/tag/ref text (pack)", "r4": "commit/tag/ref text (default rules)",
+         "r5": "file names (pack)", "r6": "file names (default rules)"}
+def pid(x):
+    return hashlib.sha256(x.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+try:
+    paths = open(os.path.join(t, "paths.txt"), encoding="utf-8", errors="surrogateescape").read().split("\n")
+except Exception:
+    paths = []
+for r in ("r1", "r2", "r3", "r4", "r5", "r6"):
+    try:
+        data = json.load(open(os.path.join(t, r + ".json")))
+    except Exception:
+        continue
+    for f in data or []:
+        rule = f.get("RuleID", "?")
+        line = f.get("StartLine", 0)
+        commit = (f.get("Commit") or "")[:8] or "-"
+        out = "trace-guard:   %s: rule=%s commit=%s line=%s" % (kinds[r], rule, commit, line)
+        if r in ("r1", "r2") and f.get("File"):
+            out += " path-id=%s" % pid(f["File"])
+        if r in ("r5", "r6") and 1 <= line <= len(paths):
+            out += " path-id=%s" % pid(paths[line - 1][len(mark):])
+        if show:
+            out += " raw-file=%r raw-fingerprint=%s" % (f.get("File", ""), f.get("Fingerprint", ""))
+        print(out)
+PY
+    else
+        for r in r1 r2 r3 r4 r5 r6; do
+            [ -f "$T/$r.json" ] || continue
+            n=$(grep -c '"RuleID"' "$T/$r.json" || true)
+            [ "${n:-0}" -eq 0 ] || say "  $r: $n finding(s) (python3 not found, no details)"
+        done
+    fi
+}
+
+if [ $UNKNOWN -eq 1 ]; then
+    say "BLOCKED: gitleaks returned an unexpected status or printed an error (unknown = blocked)"
+    [ "$SHOW" != 1 ] || sed -n 1,5p "$T/gl.err" >&2 || true
+    exit 1
+fi
+if [ $FAIL -eq 1 ]; then
+    cnt=0
+    for r in r1 r2 r3 r4 r5 r6; do
+        if [ -s "$T/$r.json" ]; then
+            n=$(grep -c '"RuleID"' "$T/$r.json" || true)
+            cnt=$((cnt + ${n:-0}))
+        fi
+    done
+    if [ "$cnt" -eq 0 ]; then
+        say "BLOCKED: gitleaks failed without a report (configuration or run error)"
+        [ "$SHOW" != 1 ] || sed -n 1,5p "$T/gl.err" >&2 || true
+        exit 1
+    fi
+    say "BLOCKED: findings listed per report kind (the same value can appear in the pack and the default-rules report); no values, names or fingerprints are printed (see README: Finding the file)"
+    summarize
+    exit 1
+fi
+
+while read -r pos obj; do
+    n=$(g rev-list --count "$obj"$NOT 2>/dev/null || echo "?")
+    say "ref#$pos ok ($n commits)"
+done <"$T/refs.txt"
+exit 0
