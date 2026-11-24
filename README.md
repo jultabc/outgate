@@ -1,4 +1,6 @@
-# gitleaks-traces + trace-guard
+# outgate
+
+`gitleaks-traces` (rule pack) + `trace-guard` (pre-push hook).
 
 A small rule pack and a POSIX `sh` pre-push bridge for [gitleaks](https://github.com/gitleaks/gitleaks).
 It looks for personal traces before a push leaves your machine: personal e-mail
@@ -43,6 +45,7 @@ Findings print a path id instead of the path. To see the names, run locally:
 
 and hash a candidate: `printf '%s' '<path>' | shasum -a 256 | cut -c1-12`. The line number is the line in the file
 (file findings) or in the path list (name findings, the list is the sorted unique names of the range).
+For name findings the path id is the hash of the converted name (control characters already replaced by `?`).
 The allow-file fingerprint format is `<full commit sha>:<path>:<rule id>:<line>` (one per line, `.gitleaksignore` format);
 build it from the local output. Name findings and findings in commit, tag or ref text have no file in their
 fingerprint and cannot be allowed through the ignore file.
@@ -107,3 +110,10 @@ in the comment block at the top of the file.
 Name conversion uses `tr '\001-\037\177' '?'` and `tr '\000' '\n'` under `LC_ALL=C`. Octal escapes and ranges work the same in BSD tr (macOS, tested) and GNU tr.
 
 An allow file that is a hard link to a file inside the repository cannot be detected by the hook.
+
+Tested on macOS with BSD tools and gitleaks 8.30.1. Not yet tested: Linux, a system without `perl`,
+and pushes to a GitHub remote.
+
+## License
+
+MIT, see `LICENSE`. gitleaks is a separate project and is not included.
